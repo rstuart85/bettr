@@ -5,7 +5,7 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { spaces, machines, panes, agents, terminals, focused, setAgentOrder, run, openOverlay, hc, theme, shared, setShared, settings } from "herdr";
+import { spaces, machines, panes, agents, terminals, focused, setAgentOrder, run, openOverlay, hc, exec, theme, shared, setShared, settings } from "herdr";
 
 // Agent and sub-agent rows are ROW tall. A space row is taller by the difference in text size
 // (15 - 12), so the space between the space name and its first agent's text equals the space
@@ -30,6 +30,48 @@ const tint = (color, alpha) => {
   if (!hex) return color;
   return `#${hex.length === 3 ? [...hex].map((c) => c + c).join("") : hex.slice(0, 6)}${alpha}`;
 };
+
+// How full each Claude Code conversation is: the tokens its last reply was sent with.
+// A terminal names its conversation in the label SESSION_LABEL, set by a Claude Code
+// SessionStart hook (`hc label <terminal> claude.session=<session id>`); without the label
+// a row shows no number. Only numbers leave the script: "<id> <tokens>" a line.
+// The token arithmetic follows nozikov/herdr-usage-limits' session.sh (MIT).
+// ponytail: reads the last 1 MB of each conversation file, so a reply after a larger
+// tool result shows no number until the next one; read more if that is seen.
+const SESSION_LABEL = "claude.session";
+const SESSION_ID = /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+const CONTEXT_EVERY = 60000; // ms
+// ponytail: every conversation is taken to have a 1M-token window; the files don't say.
+// One on a 200k model reads a fifth of its real share: read the model too if that matters.
+const CONTEXT_WINDOW = 1000000;
+// Share of the window in use, as a whole percent, and its color: under 25 green, under 50 orange, else red.
+const contextShare = (tokens) => Math.round((tokens / CONTEXT_WINDOW) * 100);
+// Muted (at CONTEXT_ALPHA), so a row's status mark stays the brightest thing on it.
+const CONTEXT_ALPHA = "8c"; // 55%
+const contextColor = (share, t) => tint(share < 25 ? t.ansi2 ?? t.working : share < 50 ? t.ansi3 ?? t.done : t.ansi1 ?? t.blocked, CONTEXT_ALPHA);
+const CONTEXT_SCRIPT = String.raw`
+for id in "$@"; do
+  for f in "${"$"}{CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/"$id".jsonl; do
+    [ -f "$f" ] || continue
+    tail -c 1000000 "$f" | awk -v id="$id" '
+      function num(s, k,   p) { p = "\"" k "\":[0-9]+"; if (!match(s, p)) return 0; return substr(s, RSTART + length(k) + 3, RLENGTH - length(k) - 3) + 0 }
+      /"subtype":"compact_boundary"/ { n = num($0, "postTokens") }
+      /"type":"assistant"/ && /"isSidechain":false/ {
+        u = index($0, "\"usage\":{")
+        if (u) {
+          s = substr($0, u)
+          # With server tools, usage adds up every request of the turn: the last one is the context.
+          i = index(s, "\"iterations\":[")
+          if (i) { t = substr(s, i); while ((i = index(t, "{\"input_tokens\":")) > 0) { s = substr(t, i); t = substr(t, i + 1) } }
+          m = num(s, "input_tokens") + num(s, "cache_creation_input_tokens") + num(s, "cache_read_input_tokens")
+          if (m > 0) n = m
+        }
+      }
+      END { if (n) print id, n }'
+  done
+done`;
+// The machine a terminal address ("machine/t7") names, null for this computer ("t7").
+const machineOf = (address) => (address.includes("/") ? address.split("/")[0] : null);
 
 // Agent rows, from the former Agents panel.
 const clean = (s) => (s ?? "").replace(/^[^\p{L}\p{N}]+/u, "").trim();
@@ -82,6 +124,34 @@ export default class Spaces extends View {
     cx.timer.every(30000, (cx) => cx.notify());
     this.refreshMachines(cx);
     cx.timer.every(15000, cx => this.refreshMachines(cx));
+    this.context = {}; // conversation id -> tokens in its context
+    this.readContext(cx);
+    cx.timer.every(CONTEXT_EVERY, cx => this.readContext(cx));
+  }
+
+  // Asks each machine once for the context of every conversation its live terminals name.
+  readContext(cx) {
+    const ids = new Map(); // machine -> conversation ids
+    for (const k of terminals()) {
+      const id = k.labels?.[SESSION_LABEL];
+      if (k.state !== "live" || typeof id !== "string" || !SESSION_ID.test(id)) continue;
+      const on = machineOf(k.address);
+      if (!ids.has(on)) ids.set(on, []);
+      ids.get(on).push(id);
+    }
+    for (const [on, list] of ids) {
+      cx.spawn(async cx => {
+        try {
+          const r = await exec("sh", ["-c", CONTEXT_SCRIPT, "context", ...list], { on });
+          if (r.code !== 0) return;
+          for (const line of r.stdout.split("\n")) {
+            const [id, n] = line.split(" ");
+            if (SESSION_ID.test(id) && Number(n) > 0) this.context[id] = Number(n);
+          }
+          cx.notify();
+        } catch {} // No sh there (Windows), or the machine is away: no numbers.
+      });
+    }
   }
 
   refreshMachines(cx) {
@@ -236,6 +306,7 @@ export default class Spaces extends View {
     const name = this.names.get(a.address);
     // A terminal that was an agent earlier still has that agent's stamp: no time for it.
     const when = a.plain ? 0 : this.changed[a.address]?.at ?? 0;
+    const context = a.plain ? 0 : this.context[this.sessions.get(a.address)] ?? 0;
     return h_flex()
       .id(`ag-${a.address}`)
       // The focused background starts at the space's tab count, with the same rounding.
@@ -259,7 +330,9 @@ export default class Spaces extends View {
         a.program.tint ? svg(a.program.icon).size(ICON).text_color(t.muted) : image(a.program.icon).size(ICON))))
       .child(mono(div()).flex_1().min_w(0).truncate().text_size(12).child(name))
       .when(subs.length > 0, el => el.child(this.fold(t, a, subs)))
-      .when(Boolean(when), el => el.child(mono(div()).flex_none().text_size(12).text_color(t.dim).child(duration(now - when))))
+      // How full its conversation is.
+      .when(Boolean(context), el => el.child(mono(div()).flex_none().text_size(12).text_color(contextColor(contextShare(context), t)).child(`${contextShare(context)}%`)))
+      .when(Boolean(when), el => el.child(mono(div()).flex_none().w(26).flex().justify_end().text_size(12).text_color(t.dim).child(duration(now - when))))
       .child(this.status(t, a));
   }
 
@@ -270,6 +343,7 @@ export default class Spaces extends View {
     const now = Date.now();
     this.listed = new Map(list.map((a) => [a.address, a.status]));
     this.all = terminals();
+    this.sessions = new Map(this.all.map((k) => [k.address, k.labels?.[SESSION_LABEL]]));
     this.track(list, now);
     this.hold(list);
     // Each agent's live sub-agents, found once per render: the sort and the rows both use them.
