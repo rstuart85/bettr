@@ -3,7 +3,7 @@
 // its other terminals (shells, editors).
 // Click to switch, right-click for its menu, drag to reorder.
 
-import { View, div, svg } from "gpui-kit";
+import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
 import { spaces, machines, panes, agents, terminals, focused, setAgentOrder, run, openOverlay, hc, theme, shared, setShared, settings } from "herdr";
 
@@ -14,6 +14,8 @@ const ROW = 26, SPACE_ROW = ROW + 3, SPACE_GAP = 7;
 // The tab count before a space's name: a BADGE square (two digits fit; more widen it), then
 // BADGE_GAP; agent rows start their names at the same place.
 const BADGE = 15, BADGE_GAP = 6;
+// An agent row's parts are GAP apart. Its icon and that gap fill the tab count's place, so names stay aligned.
+const GAP = 9, ICON = BADGE + BADGE_GAP - GAP;
 // Where a space's tab count starts: the space row's padding.
 const COUNT_LEFT = 8;
 
@@ -238,13 +240,12 @@ export default class Spaces extends View {
       .id(`ag-${a.address}`)
       // The focused background starts at the space's tab count, with the same rounding.
       .ml(COUNT_LEFT)
-      .pl(BADGE + BADGE_GAP)
       .pr(8)
       .h(ROW)
       .flex_none()
       .rounded(4)
       .items_center()
-      .gap(9)
+      .gap(GAP)
       // The run time's size; the name is 12, under the space name's 15.
       .text_size(11)
       .cursor_pointer()
@@ -253,6 +254,9 @@ export default class Spaces extends View {
       .text_color(a.focused ? t.foreground : t.muted)
       .hover((s) => s.text_color(t.foreground))
       .on_click(() => run("pane.focus", { pane: a.pane }))
+      // What runs there, as on its tab: the program's icon, under the space's tab count.
+      .child(div().w(ICON).h(ICON).flex_none().when(Boolean(a.program?.icon), el => el.child(
+        a.program.tint ? svg(a.program.icon).size(ICON).text_color(t.muted) : image(a.program.icon).size(ICON))))
       .child(mono(div()).flex_1().min_w(0).truncate().text_size(12).child(name))
       .when(subs.length > 0, el => el.child(this.fold(t, a, subs)))
       .when(Boolean(when), el => el.child(mono(div()).flex_none().text_size(12).text_color(t.dim).child(duration(now - when))))
